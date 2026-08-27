@@ -12,9 +12,9 @@ def request_cost(
     price_in_per_m: float,
     price_out_per_m: float,
     cached_in: int = 0,
-    cache_discount: float = 0.10,   # Anthropic cached-read ~0.1x (=-90%)
+    cache_discount: float = 0.10,
     batch: bool = False,
-    batch_discount: float = 0.50,   # Batch API ~ -50%
+    batch_discount: float = 0.50,
 ) -> float:
     """USD cost of a single request. Cached input billed at cache_discount x price."""
     cached_in = min(max(0, cached_in), input_tok)
@@ -42,37 +42,61 @@ def discount_stack(
     batch_discount: float = 0.50,
     cache_discount: float = 0.10,
 ) -> float:
-    """Effective fraction of the naive bill after stacking discounts (input-heavy view).
-
-    Discounts MULTIPLY: cache applies to the cached share of input, batch to the
-    whole bill. batch + 100% cache-hit -> 0.5 * 0.1 = 0.05 (~95% off).
-    """
+    """Effective fraction of the naive bill after stacking discounts."""
     cache_mult = cache_hit_frac * cache_discount + (1.0 - cache_hit_frac)
     batch_mult = batch_discount if batch else 1.0
     return cache_mult * batch_mult
 
 
-def break_even_utilization(discount_frac: float) -> float:
-    """Utilization at which a commitment pays off ~= 1 - discount.
+def cache_break_even_reads(
+    write_cost_per_m: float,
+    price_in_per_m: float = 1.0,
+    read_discount: float = 0.10,
+) -> float:
+    """Số lượt đọc lại tối thiểu để phần tiết kiệm bù chi phí ghi cache.
 
-    A 45% reserved discount needs ~55% utilization (~13.2h/day) to beat on-demand.
+    ``write_cost_per_m`` là chi phí thiết lập/ghi cache cho một triệu token.
+    Mỗi lượt đọc lại tiết kiệm ``price_in_per_m * (1-read_discount)``.
     """
+    write_cost = max(0.0, float(write_cost_per_m))
+    normal_read_cost = max(0.0, float(price_in_per_m))
+    discount = max(0.0, min(1.0, float(read_discount)))
+    saving_per_read = normal_read_cost * (1.0 - discount)
+    if saving_per_read <= 0:
+        return float("inf")
+    return write_cost / saving_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    price_in_per_m: float = 1.0,
+) -> bool:
+    """Trả về True khi số lượt đọc cache vượt điểm hòa vốn.
+
+    Tại đúng điểm hòa vốn, policy xem kết quả là trung tính và chưa bật cache.
+    """
+    return float(avg_cache_reads) > cache_break_even_reads(
+        write_cost_per_m=write_cost_per_m,
+        price_in_per_m=price_in_per_m,
+        read_discount=read_discount,
+    )
+
+
+def break_even_utilization(discount_frac: float) -> float:
+    """Utilization at which a commitment pays off ~= 1 - discount."""
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
-
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
-    """
+def recommend_tier(hours_per_day: float, interruptible: bool,
+                   reserved_discount: float = 0.45) -> str:
+    """Pick purchasing tier from duty cycle and interruptibility."""
     duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
+    break_even = break_even_utilization(reserved_discount)
     if interruptible and hours_per_day < 24:
         return "spot"
-    if duty >= be:
+    if duty >= break_even:
         return "reserved"
     return "on_demand"
 
@@ -81,15 +105,11 @@ def spot_checkpoint_cost(
     job_hours: float,
     spot_hr: float,
     on_demand_hr: float,
-    interrupt_rate: float = 0.05,      # per-hour chance (H100 spot ~<5%)
-    ckpt_overhead_frac: float = 0.03,  # steady cost of writing checkpoints
+    interrupt_rate: float = 0.05,
+    ckpt_overhead_frac: float = 0.03,
     rework_hours_per_interrupt: float = 0.5,
 ) -> dict:
-    """Effective cost of running a checkpointable job on spot vs on-demand.
-
-    Interruptions waste the compute since the last checkpoint (rework); checkpointing
-    adds a small steady overhead. Spot still wins for interruptible jobs.
-    """
+    """Effective cost of a checkpointable spot job versus on-demand."""
     expected_interrupts = job_hours * interrupt_rate
     rework_hours = expected_interrupts * rework_hours_per_interrupt
     effective_hours = job_hours * (1.0 + ckpt_overhead_frac) + rework_hours
